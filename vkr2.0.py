@@ -1,18 +1,10 @@
 import streamlit as st
-import pandas as pd
-import matplotlib.pyplot as plt
-import numpy as np
-from datetime import datetime, timedelta
 from prophet import Prophet
 from prophet.serialize import model_from_json, model_to_json
 from darts.models import TCNModel
-from darts import TimeSeries
-import torch
+
 import tensorflow as tf
-import os
 import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
 from sklearn.preprocessing import MinMaxScaler
 from tensorflow import keras
 from keras.models import Model
@@ -21,11 +13,9 @@ from tensorflow.keras.optimizers import Adam
 from tensorflow.keras import callbacks
 import pandas as pd
 import matplotlib.pyplot as plt
-import darts
 from darts import TimeSeries
 from darts.models import TransformerModel
 from darts.dataprocessing.transformers import Scaler
-from sklearn.metrics import mean_absolute_error
 # Настройки страницы
 st.set_page_config(
     page_title="Time Series Forecasting",
