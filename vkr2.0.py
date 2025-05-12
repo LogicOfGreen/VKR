@@ -44,6 +44,20 @@ def load_pretrained_models():
     return models
 
 
+@st.cache_resource
+def load_temperature_model():
+    """Загрузка модели для прогнозирования температуры"""
+    try:
+        # Загрузка Prophet модели для температуры
+        with open('temperature_prophet_model.json', 'r') as f:
+            temp_prophet = model_from_json(f.read())
+
+        return {'prophet': temp_prophet}
+    except Exception as e:
+        st.error(f"Ошибка загрузки температурной модели: {str(e)}")
+        return None
+
+
 def validate_dataset(df):
     """Проверка данных на отрицательные значения"""
     if (df['y'] < 0).any():
@@ -61,6 +75,9 @@ def load_default_data():
     df['years'] = df.apply(lambda x: x.N // (365 * 24), axis=1)
     df.drop('N', axis=1, inplace=True)
 
+    df = df.query("SumRad != 0")
+    df = df.reset_index(drop=True)
+
     DataDays = df.groupby('days').agg(
         {'V': 'mean', 'T': 'mean', 'P': 'mean', 'DirectRad': 'sum', 'ScatterRad': 'sum', 'SumRad': 'sum'})
     DataMonths = df.groupby('months').agg(
@@ -70,10 +87,10 @@ def load_default_data():
 
     DataDays = DataDays.reset_index()
     start_date = "2014-01-01"
-    X_Prophet = DataDays[['days', 'SumRad']]
+    X_Prophet = DataDays[['days','T','SumRad']]
 
     X_Prophet['days'] = pd.to_datetime(start_date) + pd.to_timedelta(X_Prophet["days"], unit="D")
-    X_Prophet.rename(columns={"days": "ds", "SumRad": "y"}, inplace=True)
+    X_Prophet.rename(columns={"days": "ds","T" :"T" ,"SumRad": "y"}, inplace=True)
     df1 = X_Prophet
     df1 = df1[:-1]
     return df1
@@ -256,6 +273,47 @@ def make_predictions(models, data, model_type):
         st.error(f"Ошибка прогнозирования: {str(e)}")
     return None
 
+def predict_temperature(models, data):
+    """Прогнозирование температуры на год вперед"""
+    try:
+        # Прогноз с помощью Prophet
+        future = models['prophet'].make_future_dataframe(periods=365)
+        forecast = models['prophet'].predict(future)[['ds', 'yhat']]
+        return forecast[['ds', 'yhat']].rename(columns={'yhat': 'temperature'}).set_index('ds').tail(365)
+
+    except Exception as e:
+        st.error(f"Ошибка прогнозирования температуры: {str(e)}")
+        return None
+
+
+def calculate_energy(solar_rad, temperature_df):
+    """Расчёт энергии с учётом динамики температуры"""
+    # Параметры панели из статьи
+    k0 = 30.02
+    k1 = 6.28
+    beta = 0.005
+    A = 1.63
+    k_L = 0.9
+    eta_nom = 0.156
+
+    # Объединение данных по датам
+    combined = solar_rad.join(temperature_df, how='inner')
+
+    # Расчёт энергии для каждой даты
+    energy = []
+    for idx, row in combined.iterrows():
+        # Расчёт температуры панели
+        wind_speed = 1.2  # Можно добавить прогноз скорости ветра
+        T_pv = row['temperature'] + k0 + k1 / wind_speed
+
+        # Расчёт КПД
+        eta = eta_nom * (1 - beta * (T_pv - 48))
+
+        # Расчёт энергии
+        energy.append(row['mean_rad'] * eta * A * k_L * 0.95)
+
+    combined['energy'] = energy
+    return combined
 
 def main():
     st.title("Прогнозирование временных рядов")
@@ -311,32 +369,74 @@ def main():
                 except Exception as e:
                     st.error(f"Ошибка обучения: {str(e)}")
 
-    st.header("Прогнозирование")
-    model_type = st.selectbox("Выберите модель:", ['prophet', 'tcn', 'tf'])
+    st.header("Комплексный прогноз с температурной моделью")
 
-    if st.button("Сделать прогноз"):
+    # Загрузка температурной модели
+    temp_models = load_temperature_model()
 
+    if temp_models is None:
+        st.error("Не удалось загрузить температурные модели")
+        return
+
+    if st.button("Сделать комплексный прогноз"):
         with st.spinner('Идет прогнозирование...'):
-            forecast = make_predictions(models, data, model_type)
+            # 1. Прогноз солнечной радиации
+            rad_forecasts = {}
+            for model_type in ['prophet', 'tcn', 'tf']:
+                forecast = make_predictions(models, data, model_type)
+                rad_forecasts[model_type] = forecast['y']
 
-            if forecast is not None:
-                st.subheader("Результаты прогноза")
-                data = data.set_index('ds')
-                data = data.sort_values('ds').tail(365)
-                print(data.columns)
-                fig, ax = plt.subplots(figsize=(12, 6))
-                print(data)
-                print(forecast)
-                data['y'].plot(ax=ax, label='Исторические данные')
-                forecast['y'].plot(ax=ax, color='red', label='Прогноз')
-                plt.legend()
-                st.pyplot(fig)
+            # Среднее значение радиации
+            rad_combined = pd.concat(rad_forecasts.values(), axis=1)
+            rad_combined.columns = [f'rad_{col}' for col in rad_forecasts.keys()]
+            rad_combined['mean_rad'] = rad_combined.mean(axis=1)
 
-                st.download_button(
-                    label="Скачать прогноз",
-                    data=forecast.reset_index().to_csv(index=False),
-                    file_name='forecast.csv'
-                )
+            # 2. Прогноз температуры
+            temp_forecast = predict_temperature(temp_models, data)
+
+            if temp_forecast is None:
+                st.error("Ошибка прогноза температуры")
+                return
+
+            # 3. Расчёт энергии
+            final_df = calculate_energy(rad_combined[['mean_rad']], temp_forecast)
+
+            # 4. Построение графиков
+            fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(14, 12))
+
+            # График солнечной радиации
+            rad_combined['mean_rad'].plot(ax=ax1, color='orange', label='Средняя радиация')
+            ax1.set_title('Прогноз солнечной радиации')
+            ax1.set_ylabel('кВт·ч/м²')
+            ax1.legend()
+
+            # График температуры
+            final_df['temperature'].plot(ax=ax2, color='red', label='Температура воздуха')
+            ax2.set_title('Прогноз температуры')
+            ax2.set_ylabel('°C')
+            ax2.legend()
+
+            # График энергии
+            final_df['energy'].plot(ax=ax3, color='green', label='Суточная выработка')
+            final_df['energy'].cumsum().plot(
+                ax=ax3, color='blue', secondary_y=True,
+                label='Накопленная энергия', linestyle='--')
+            ax3.set_title('Выработка энергии')
+            ax3.set_ylabel('кВт·ч (суточная)')
+            ax3.right_ax.set_ylabel('кВт·ч (накопленная)')
+            ax3.legend(loc='upper left')
+            ax3.right_ax.legend(loc='upper right')
+
+            plt.tight_layout()
+            st.pyplot(fig)
+
+            # Экспорт результатов
+            st.download_button(
+                label="Скачать полные данные",
+                data=final_df.reset_index().to_csv(index=False),
+                file_name='full_forecast.csv',
+                mime='text/csv'
+            )
 
 
 if __name__ == "__main__":
