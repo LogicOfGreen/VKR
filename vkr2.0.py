@@ -32,12 +32,10 @@ st.set_page_config(
 def load_pretrained_models():
     models = {}
     try:
-        # Загрузка модели Prophet
-        with open('prophet_model.json', 'r') as f:
-            models['prophet'] = model_from_json(f.read())
+        models['tcn'] = TCNModel.load("tcn_future_model.pt")
 
-        # Загрузка модели TCN
-        models['tcn'] = TCNModel.load("darts_future_model.pt")
+        # Загрузка модели transformer
+        models['transformer'] = TransformerModel.load("darts_future_model.pt")
 
         # Загрузка TensorFlow модели
         models['tf'] = tf.keras.models.load_model('tf_model.keras')
@@ -59,6 +57,7 @@ def load_temperature_model():
 
         models['temp_ets']=ExponentialSmoothing.load('temperature_ets_model.pt')
 
+        models['temp_nbeats'] = NBEATSModel.load('temp_nbeats_model.pt')
         return models
     except Exception as e:
         st.error(f"Ошибка загрузки температурной модели: {str(e)}")
@@ -67,9 +66,10 @@ def load_temperature_model():
 
 def validate_dataset(df):
     """Проверка данных на отрицательные значения"""
-    if (df['SumRad'] < 0).any():
-        negative_rows = df[df['SumRad'] < 0]
-        return False, negative_rows
+    invalid_condition = (df['SumRad'] < 0) | (df['SumRad'] > 1000)
+    if invalid_condition.any():
+        invalid_rows = df[invalid_condition]
+        return False, invalid_rows
     return True, None
 
 
@@ -86,10 +86,6 @@ def load_default_data():
     df = df.reset_index(drop=True)
 
     DataDays = df.groupby('days').agg(
-        {'V': 'mean', 'T': 'mean', 'P': 'mean', 'DirectRad': 'sum', 'ScatterRad': 'sum', 'SumRad': 'sum'})
-    DataMonths = df.groupby('months').agg(
-        {'V': 'mean', 'T': 'mean', 'P': 'mean', 'DirectRad': 'sum', 'ScatterRad': 'sum', 'SumRad': 'sum'})
-    DataYears = df.groupby('years').agg(
         {'V': 'mean', 'T': 'mean', 'P': 'mean', 'DirectRad': 'sum', 'ScatterRad': 'sum', 'SumRad': 'sum'})
 
     DataDays = DataDays.reset_index()
@@ -137,19 +133,6 @@ def train_models(train_data):
     models = {}
     train_data_rad = train_data[['ds','y']]
 
-    # Prophet
-    modelP = Prophet(
-        yearly_seasonality=True,  # Включить годовую сезонность
-        weekly_seasonality=False,  # Отключить, если данные не недельные
-        daily_seasonality=False,
-        seasonality_mode='multiplicative',  # Для растущих трендов
-        changepoint_prior_scale=0.05  # Сглаживание резких изменений тренда
-    )
-
-    prophet_model = modelP
-    prophet_model.fit(train_data_rad)
-    models['prophet'] = prophet_model
-
     # TCN
     series = TimeSeries.from_dataframe(train_data_rad, 'ds', 'y')
 
@@ -169,7 +152,38 @@ def train_models(train_data):
     )
 
     model.fit(scaled_series, epochs=20, verbose=True)
-    models['tcn'] = model
+    models['transformer'] = model
+
+    model_nbeats = NBEATSModel(
+        input_chunk_length=365,  # Длина входного окна
+        output_chunk_length=365,  # Длина прогноза
+        generic_architecture=True,  # Универсальный режим
+        num_stacks=10,  # Количество стеков
+        num_blocks=3,  # Блоков в стеке
+        num_layers=4,  # Слоев в блоке
+        dropout=0.1,
+        random_state=42,
+        pl_trainer_kwargs={"accelerator": "cpu"}
+    )
+
+    model_nbeats.fit(
+        scaled_series,
+        epochs=30,
+        verbose=True
+    )
+
+    models['nbeats'] = model_nbeats
+
+    model_tcn = TCNModel(
+        input_chunk_length=730,
+        output_chunk_length=365,
+        batch_size=32,
+        pl_trainer_kwargs={"accelerator": "cpu"}  # Для GPU замените на "gpu"
+    )
+
+    model_tcn.fit(scaled_series, epochs=30, verbose=True)
+
+    models['tcn'] = model_tcn
 
     # tensorflow
     scaler = MinMaxScaler(feature_range=(0, 1))
@@ -226,11 +240,6 @@ def train_models(train_data):
     y_train, y_test = y[:split_idx], y[split_idx:]
 
     # Контроль переобучения
-    early_stop = callbacks.EarlyStopping(
-        monitor='val_loss',
-        patience=15,
-        restore_best_weights=True
-    )
 
     history = model.fit(
         X_train, y_train,
@@ -245,6 +254,45 @@ def train_models(train_data):
     )
 
     models['tf'] = model
+
+    return models
+
+def train_temp_models(train_data):
+    models={}
+
+    train_data_temp = train_data[['ds', 'T']]
+    train_data_temp.rename(columns={"days": "ds","T" :"y"}, inplace=True)
+    # Prophet
+    modelP = Prophet(
+        yearly_seasonality=True,  # Включить годовую сезонность
+        weekly_seasonality=False,  # Отключить, если данные не недельные
+        daily_seasonality=False,
+        seasonality_mode='additive',  # Для растущих трендов
+        changepoint_prior_scale=0.05  # Сглаживание резких изменений тренда
+    )
+
+    prophet_model = modelP
+    prophet_model.fit(train_data_temp)
+    models['temp_prophet'] = prophet_model
+
+    # 2. ETS
+    series = TimeSeries.from_dataframe(train_data_temp, 'ds', 'y')
+
+    scaler = Scaler()
+    scaled_series = scaler.fit_transform(series)
+
+    # 3. Создание и обучение ETS
+    model_ets = ExponentialSmoothing(
+        trend=SeasonalityMode.ADDITIVE,  # Вместо "add"
+        seasonal=SeasonalityMode.ADDITIVE,
+        seasonal_periods=365,
+        damped=True,
+        random_state=42
+    )
+
+    # Для данных с частотой (если индекс не задан явно)
+    model_ets.fit(scaled_series)
+    models['temp_ets']=model_ets
 
     model_nbeats = NBEATSModel(
         input_chunk_length=365,  # Длина входного окна
@@ -264,64 +312,36 @@ def train_models(train_data):
         verbose=True
     )
 
-    models['nbeats'] = model_nbeats
-
-    return models
-
-def train_temp_models(train_data):
-    models={}
-
-    train_data_rad = train_data[['ds', 'T']]
-    train_data_rad.rename(columns={"days": "ds","T" :"y"}, inplace=True)
-    # Prophet
-    modelP = Prophet(
-        yearly_seasonality=True,  # Включить годовую сезонность
-        weekly_seasonality=False,  # Отключить, если данные не недельные
-        daily_seasonality=False,
-        seasonality_mode='multiplicative',  # Для растущих трендов
-        changepoint_prior_scale=0.05  # Сглаживание резких изменений тренда
-    )
-
-    prophet_model = modelP
-    prophet_model.fit(train_data_rad)
-    models['temp_prophet'] = prophet_model
-
-    series = TimeSeries.from_dataframe(train_data_rad, 'ds', 'y')
-
-    # 2. Масштабирование
-    scaler = Scaler()
-    scaled_series = scaler.fit_transform(series)
-
-    # 3. Создание и обучение ETS
-    model_ets = ExponentialSmoothing(
-        trend=SeasonalityMode.ADDITIVE,  # Вместо "add"
-        seasonal=SeasonalityMode.ADDITIVE,
-        seasonal_periods=365,
-        damped=True,
-        random_state=42
-    )
-
-    # Для данных с частотой (если индекс не задан явно)
-    model_ets.fit(scaled_series)
-    models['temp_ets']=model_ets
+    models['temp_nbeats'] = model_nbeats
     return models
 
 def make_predictions(models, data, model_type):
     """Создание прогнозов"""
     try:
-        if model_type == 'prophet':
-            future = models['prophet'].make_future_dataframe(periods=365)
-            forecast = models['prophet'].predict(future)
-            return forecast[['ds', 'yhat']].rename(columns={'yhat': 'y'}).set_index('ds').tail(365)
-
-        elif model_type == 'tcn':
-
+        if model_type == 'tcn':
             series = TimeSeries.from_dataframe(data, 'ds', 'y')
 
             scaler = Scaler()
             train_scaled = scaler.fit_transform(series)
 
             pred_scaled = models['tcn'].predict(n=365)
+            pred = scaler.inverse_transform(pred_scaled)
+
+            dates = pred.time_index
+            values = pred.values()
+
+            pred_df = pd.DataFrame({"ds": dates, "y": values.flatten()})
+            pred_df = pred_df.set_index('ds')
+            return pred_df
+
+        elif model_type == 'transformer':
+
+            series = TimeSeries.from_dataframe(data, 'ds', 'y')
+
+            scaler = Scaler()
+            train_scaled = scaler.fit_transform(series)
+
+            pred_scaled = models['transformer'].predict(n=365)
             pred = scaler.inverse_transform(pred_scaled)
 
             dates = pred.time_index
@@ -386,13 +406,28 @@ def predict_temperature(models, data, model_type):
             forecast = models['temp_prophet'].predict(future)[['ds', 'yhat']]
             print(forecast)
             return forecast[['ds', 'yhat']].rename(columns={'yhat': 'y'}).set_index('ds').tail(365)
-        if model_type == 'temp_ets':
+        elif model_type == 'temp_ets':
             series = TimeSeries.from_dataframe(train_data_rad, 'ds', 'y')
 
             scaler = Scaler()
             train_scaled = scaler.fit_transform(series)
 
             pred_scaled = models['temp_ets'].predict(n=365)
+            pred = scaler.inverse_transform(pred_scaled)
+
+            dates = pred.time_index
+            values = pred.values()
+
+            pred_df = pd.DataFrame({"ds": dates, "y": values.flatten()})
+            pred_df = pred_df.set_index('ds')
+            return pred_df
+        elif model_type == 'temp_nbeats':
+            series = TimeSeries.from_dataframe(train_data_rad, 'ds', 'y')
+
+            scaler = Scaler()
+            train_scaled = scaler.fit_transform(series)
+
+            pred_scaled = models['temp_nbeats'].predict(n=365)
             pred = scaler.inverse_transform(pred_scaled)
 
             dates = pred.time_index
@@ -497,7 +532,7 @@ def main():
                 valid, error_data = validate_dataset(df)
 
                 if not valid:
-                    st.error("Обнаружены отрицательные значения в следующих строках:")
+                    st.error("Обнаружены отрицательные значения или слишком большие значения в следующих строках:")
                     st.write(error_data)
                     return
 
@@ -525,24 +560,24 @@ def main():
                     temp_models = train_temp_models(data.reset_index())
                     st.success("Модели успешно обучены!")
 
-                    # Сохранение моделей
-                    with open('new_prophet_model.json', 'w') as f:
-                        f.write(model_to_json(models['prophet']))
-
                     with open('new_temperature_prophet_model.json', 'w') as f:
                         f.write(model_to_json(temp_models['temp_prophet']))
 
                     temp_models['temp_ets'].save('new_temp_ets_model.pt')
 
-                    models['tcn'].save('new_darts_model.pt')
+                    temp_models['temp_nbeats'].save('new_temp_nbeats_model.pt')
+
+                    models['transformer'].save('new_darts_model.pt')
 
                     models['nbeats'].save('new_nbeats_model.pt')
+
+                    models['tcn'].save('new_tcn_model.pt')
 
                     models['tf'].save('new_tf_model.keras')
 
 
                     rad_forecasts = {}
-                    for model_type in ['prophet', 'tcn', 'tf', 'nbeats']:
+                    for model_type in ['tcn', 'transformer', 'tf', 'nbeats']:
                         forecast = make_predictions(models, data, model_type)
                         rad_forecasts[model_type] = forecast['y']
 
@@ -554,7 +589,7 @@ def main():
                     # 2. Прогноз температуры
 
                     temp_forecasts = {}
-                    for model_type in ['temp_prophet', 'temp_ets']:
+                    for model_type in ['temp_prophet', 'temp_ets', 'temp_nbeats']:
                         forecast = predict_temperature(temp_models, data, model_type)
                         temp_forecasts[model_type] = forecast['y']
 
@@ -618,7 +653,7 @@ def main():
             with st.spinner('Идет прогнозирование...'):
                 # 1. Прогноз солнечной радиации
                 rad_forecasts = {}
-                for model_type in ['prophet', 'tcn', 'tf', 'nbeats']:
+                for model_type in ['tcn', 'transformer', 'tf', 'nbeats']:
                     forecast = make_predictions(models, data, model_type)
                     rad_forecasts[model_type] = forecast['y']
 
@@ -630,7 +665,7 @@ def main():
                 # 2. Прогноз температуры
 
                 temp_forecasts = {}
-                for model_type in ['temp_prophet', 'temp_ets']:
+                for model_type in ['temp_prophet', 'temp_ets','temp_nbeats']:
                     forecast = predict_temperature(temp_models, data, model_type)
                     temp_forecasts[model_type] = forecast['y']
 
