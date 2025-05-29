@@ -2,23 +2,37 @@ import streamlit as st
 from prophet import Prophet
 from prophet.serialize import model_from_json, model_to_json
 from darts.models import TCNModel
-
 import tensorflow as tf
+
 import numpy as np
 from sklearn.preprocessing import MinMaxScaler
 from tensorflow import keras
 from keras.models import Model
+
 from tensorflow.keras.layers import Input, LSTM, Dense, RepeatVector,  TimeDistributed, Attention, Concatenate, Dropout, BatchNormalization
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras import callbacks
+
 import pandas as pd
 import matplotlib.pyplot as plt
 from darts import TimeSeries
 from darts.models import TransformerModel
+
 from darts.dataprocessing.transformers import Scaler
 from darts.models import ExponentialSmoothing
 from darts.utils.utils import SeasonalityMode
+
 from darts.models import NBEATSModel
+from datetime import datetime
+from geopy.geocoders import Nominatim
+
+from timezonefinder import TimezoneFinder
+import pytz
+from astral.sun import sun
+
+from pvlib.solarposition import get_solarposition
+from astral import LocationInfo
+
 # Настройки страницы
 st.set_page_config(
     page_title="Time Series Forecasting",
@@ -440,61 +454,15 @@ def predict_temperature(models, data, model_type):
         st.error(f"Ошибка прогнозирования температуры: {str(e)}")
         return None
 
+def handle_training():
+    st.header("Обучение моделей")
 
-def calculate_energy(solar_rad, temperature_df , panel_params):
-
-    default_params = {
-        'k0': 30.02,
-        'k1': 6.28,  #
-        'beta': -0.0041,  # Отрицательный коэффициент
-        'A': 1.65,  # Площадь панели
-        'eta_nom': 0.153,  # Номинальный КПД
-        'wind_speed': 1.2,
-        'K_L' : 0.9, # Фиксированное значение по статье
-    }
-
-    # Объединяем параметры (пользовательские имеют приоритет)
-    params = {**default_params, **panel_params}
-
-    # Валидация критических параметров
-    if params['A'] <= 0:
-        raise ValueError("Площадь панели должна быть положительной")
-    if not (0 < params['eta_nom'] <= 0.4):
-        raise ValueError("КПД должен быть в диапазоне 0-40%")
-
-    # Объединение данных по датам
-    combined = solar_rad.join(temperature_df, how='inner')
-
-    # Расчёт энергии для каждой даты
-    energy = []
-    for idx, row in combined.iterrows():
-
-        T_pv = row['mean_temp'] + row['mean_rad']/(params['k0'] + params['k1'] * params['wind_speed'])
-
-        # Расчёт КПД
-        eta = params['eta_nom'] * (1 + params['beta'] * (T_pv - 48))
-
-        # Расчёт энергии
-        energy.append(row['mean_rad'] * eta * params['A'] * params['K_L'])
-    combined['energy'] = energy
-    return combined
-
-def main():
-    st.title("Прогнозирование выработонной энергии солнечной панелью")
-    models = load_pretrained_models()
-
-    # Загрузка температурной модели
-    temp_models = load_temperature_model()
-
+    # Секция параметров панели
     st.sidebar.header("Параметры солнечной панели")
-
-    # Чекбокс для активации кастомных параметров
     use_custom_panel = st.sidebar.checkbox("Использовать свои параметры панели")
 
     panel_params = {}
-
     if use_custom_panel:
-        # Валидируемые параметры с подсказками
         panel_params['A'] = st.sidebar.number_input(
             "Площадь панели (м²)",
             value=1.65,
@@ -509,7 +477,7 @@ def main():
             max_value=40,
             value=15,
             help="Стандартные значения: 15-22%"
-        ) / 100  # Конвертируем проценты в доли
+        ) / 100
 
         panel_params['beta'] = -abs(st.sidebar.number_input(
             "Температурный коэффициент мощности (%/°C)",
@@ -520,7 +488,7 @@ def main():
             help="Для кремния: 0.3-0.5%/°C. Вводите положительное значение!"
         )) / 100
 
-    # Загрузка данных
+    # Секция загрузки данных
     st.sidebar.header("Настройки данных")
     use_custom_data = st.sidebar.checkbox("Использовать свои данные")
 
@@ -530,12 +498,10 @@ def main():
             try:
                 df = pd.read_csv(uploaded_file)
                 valid, error_data = validate_dataset(df)
-
                 if not valid:
-                    st.error("Обнаружены отрицательные значения или слишком большие значения в следующих строках:")
+                    st.error("Обнаружены ошибки в данных:")
                     st.write(error_data)
                     return
-
                 data = prepare_data(df)
             except Exception as e:
                 st.error(f"Ошибка загрузки данных: {str(e)}")
@@ -543,180 +509,436 @@ def main():
     else:
         data = load_default_data()
 
-    # Режим работы
-    st.sidebar.header("Режим работы")
-    mode = st.sidebar.radio("Выберите режим:", ['Предсказание', 'Обучение'])
+    # Основная логика обучения
+    if st.button("Начать обучение"):
+        if not use_custom_data:
+            st.warning("Для обучения моделей необходимо загрузить свои данные")
+            return
 
-    if mode == 'Обучение' and not use_custom_data:
-        st.warning("Для обучения моделей необходимо загрузить свои данные")
-        return
+        with st.spinner('Обучение моделей...'):
+            try:
+                st.header("Обучение моделей на новых данных")
+                with st.spinner('Обучение моделей...'):
+                    try:
+                        models = train_models(data.reset_index())
+                        temp_models = train_temp_models(data.reset_index())
+                        st.success("Модели успешно обучены!")
 
-    if mode == 'Обучение':
-        st.header("Обучение моделей на новых данных")
-        if st.button("Начать обучение"):
-            with st.spinner('Обучение моделей...'):
-                try:
-                    models = train_models(data.reset_index())
-                    temp_models = train_temp_models(data.reset_index())
-                    st.success("Модели успешно обучены!")
+                        with open('new_temperature_prophet_model.json', 'w') as f:
+                            f.write(model_to_json(temp_models['temp_prophet']))
 
-                    with open('new_temperature_prophet_model.json', 'w') as f:
-                        f.write(model_to_json(temp_models['temp_prophet']))
+                        temp_models['temp_ets'].save('new_temp_ets_model.pt')
 
-                    temp_models['temp_ets'].save('new_temp_ets_model.pt')
+                        temp_models['temp_nbeats'].save('new_temp_nbeats_model.pt')
 
-                    temp_models['temp_nbeats'].save('new_temp_nbeats_model.pt')
+                        models['transformer'].save('new_darts_model.pt')
 
-                    models['transformer'].save('new_darts_model.pt')
+                        models['nbeats'].save('new_nbeats_model.pt')
 
-                    models['nbeats'].save('new_nbeats_model.pt')
+                        models['tcn'].save('new_tcn_model.pt')
 
-                    models['tcn'].save('new_tcn_model.pt')
+                        models['tf'].save('new_tf_model.keras')
 
-                    models['tf'].save('new_tf_model.keras')
+                        rad_forecasts = {}
+                        for model_type in ['tcn', 'transformer', 'tf', 'nbeats']:
+                            forecast = make_predictions(models, data, model_type)
+                            rad_forecasts[model_type] = forecast['y']
 
+                        # Среднее значение радиации
+                        rad_combined = pd.concat(rad_forecasts.values(), axis=1)
+                        rad_combined.columns = [f'rad_{col}' for col in rad_forecasts.keys()]
+                        rad_combined['mean_rad'] = rad_combined.mean(axis=1)
 
-                    rad_forecasts = {}
-                    for model_type in ['tcn', 'transformer', 'tf', 'nbeats']:
-                        forecast = make_predictions(models, data, model_type)
-                        rad_forecasts[model_type] = forecast['y']
+                        # 2. Прогноз температуры
 
-                    # Среднее значение радиации
-                    rad_combined = pd.concat(rad_forecasts.values(), axis=1)
-                    rad_combined.columns = [f'rad_{col}' for col in rad_forecasts.keys()]
-                    rad_combined['mean_rad'] = rad_combined.mean(axis=1)
+                        temp_forecasts = {}
+                        for model_type in ['temp_prophet', 'temp_ets', 'temp_nbeats']:
+                            forecast = predict_temperature(temp_models, data, model_type)
+                            temp_forecasts[model_type] = forecast['y']
 
-                    # 2. Прогноз температуры
+                        # Среднее значение радиации
+                        temp_combined = pd.concat(temp_forecasts.values(), axis=1)
+                        temp_combined.columns = [f'temp_{col}' for col in temp_forecasts.keys()]
+                        temp_combined['mean_temp'] = temp_combined.mean(axis=1)
 
-                    temp_forecasts = {}
-                    for model_type in ['temp_prophet', 'temp_ets', 'temp_nbeats']:
-                        forecast = predict_temperature(temp_models, data, model_type)
-                        temp_forecasts[model_type] = forecast['y']
+                        if temp_combined is None:
+                            st.error("Ошибка прогноза температуры")
+                            return
 
-                    # Среднее значение радиации
-                    temp_combined = pd.concat(temp_forecasts.values(), axis=1)
-                    temp_combined.columns = [f'temp_{col}' for col in temp_forecasts.keys()]
-                    temp_combined['mean_temp'] = temp_combined.mean(axis=1)
+                        # 3. Расчёт энергии
+                        final_df = calculate_energy(rad_combined[['mean_rad']], temp_combined[['mean_temp']],
+                                                    panel_params)
 
+                        # 4. Построение графиков
+                        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(14, 12))
 
-                    if temp_combined is None:
-                        st.error("Ошибка прогноза температуры")
-                        return
+                        # График солнечной радиации
+                        rad_combined['mean_rad'].plot(ax=ax1, color='orange', label='Средняя радиация')
+                        ax1.set_title('Прогноз солнечной радиации')
+                        ax1.set_ylabel('кВт·ч/м²')
+                        ax1.legend()
 
-                    # 3. Расчёт энергии
-                    final_df = calculate_energy(rad_combined[['mean_rad']], temp_combined[['mean_temp']], panel_params)
+                        # График температуры
+                        final_df['mean_temp'].plot(ax=ax2, color='red', label='Температура воздуха')
+                        ax2.set_title('Прогноз температуры')
+                        ax2.set_ylabel('°C')
+                        ax2.legend()
 
-                    # 4. Построение графиков
-                    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(14, 12))
+                        # График энергии
+                        final_df['energy'].plot(ax=ax3, color='green', label='Суточная выработка')
+                        final_df['energy'].cumsum().plot(
+                            ax=ax3, color='blue', secondary_y=True,
+                            label='Накопленная энергия', linestyle='--')
+                        ax3.set_title('Выработка энергии')
+                        ax3.set_ylabel('кВт·ч (суточная)')
+                        ax3.right_ax.set_ylabel('кВт·ч (накопленная)')
+                        ax3.legend(loc='upper left')
+                        ax3.right_ax.legend(loc='upper right')
 
-                    # График солнечной радиации
-                    rad_combined['mean_rad'].plot(ax=ax1, color='orange', label='Средняя радиация')
-                    ax1.set_title('Прогноз солнечной радиации')
-                    ax1.set_ylabel('кВт·ч/м²')
-                    ax1.legend()
+                        plt.tight_layout()
+                        st.pyplot(fig)
 
-                    # График температуры
-                    final_df['mean_temp'].plot(ax=ax2, color='red', label='Температура воздуха')
-                    ax2.set_title('Прогноз температуры')
-                    ax2.set_ylabel('°C')
-                    ax2.legend()
+                        # Экспорт результатов
+                        st.download_button(
+                            label="Скачать полные данные",
+                            data=final_df.reset_index().to_csv(index=False),
+                            file_name='full_forecast.csv',
+                            mime='text/csv'
+                        )
+                    except Exception as e:
+                        st.error(f"Ошибка обучения: {str(e)}")
+            except Exception as e:
+                st.error(f"Ошибка обучения: {str(e)}")
 
-                    # График энергии
-                    final_df['energy'].plot(ax=ax3, color='green', label='Суточная выработка')
-                    final_df['energy'].cumsum().plot(
-                        ax=ax3, color='blue', secondary_y=True,
-                        label='Накопленная энергия', linestyle='--')
-                    ax3.set_title('Выработка энергии')
-                    ax3.set_ylabel('кВт·ч (суточная)')
-                    ax3.right_ax.set_ylabel('кВт·ч (накопленная)')
-                    ax3.legend(loc='upper left')
-                    ax3.right_ax.legend(loc='upper right')
+def handle_prediction():
+    st.header("Прогнозирование выработки энергии")
 
-                    plt.tight_layout()
-                    st.pyplot(fig)
+    if 'lat' not in st.session_state or 'lon' not in st.session_state:
+        st.session_state.lat = 51.52  # Широта Байкальска
+        st.session_state.lon = 104.14  # Долгота Байкальска
+        st.info("Используются координаты Байкальска по умолчанию")
 
-                    # Экспорт результатов
-                    st.download_button(
-                        label="Скачать полные данные",
-                        data=final_df.reset_index().to_csv(index=False),
-                        file_name='full_forecast.csv',
-                        mime='text/csv'
-                    )
-                except Exception as e:
-                    st.error(f"Ошибка обучения: {str(e)}")
+        # Блок 1: Параметры панели
+    with st.sidebar.expander("Технические характеристики"):
+        panel_params = {
+            'A': st.number_input(
+                "Площадь панели (м²)",
+                value=1.65,
+                min_value=0.1,
+                max_value=10.0
+            ),
+            'eta_nom': st.number_input(
+                "Номинальный КПД (%)",
+                min_value=5,
+                max_value=40,
+                value=15
+            ) / 100
+        }
 
+        # Блок 2: Параметры ориентации
+    with st.sidebar.expander("Ориентация панели"):
+        orientation_params = {
+            'tilt': st.number_input(
+                "Угол наклона (°)",
+                min_value=0,
+                max_value=90,
+                value=30,
+                help="0° - горизонтально, 90° - вертикально"
+            ),
+            'azimuth': st.number_input(
+                "Азимут направления (°)",
+                min_value=0,
+                max_value=360,
+                value=180,
+                help="0° - Север, 90° - Восток, 180° - Юг, 270° - Запад"
+            )
+        }
 
+        # Блок 3: Рекомендации по установке
+    show_panel_recommendations()
 
-    if mode == 'Предсказание':
+    # Загрузка предобученных моделей
+    models = load_pretrained_models()
+    temp_models = load_temperature_model()
+
+    data = load_default_data()
+    # Основная логика прогнозирования
+    if st.button("Сделать прогноз"):
         st.header("Прогнозирование на основе имеющихся данных")
-        if st.button("Сделать прогноз"):
-            with st.spinner('Идет прогнозирование...'):
-                # 1. Прогноз солнечной радиации
-                rad_forecasts = {}
-                for model_type in ['tcn', 'transformer', 'tf', 'nbeats']:
-                    forecast = make_predictions(models, data, model_type)
-                    rad_forecasts[model_type] = forecast['y']
+        with st.spinner('Идет прогнозирование...'):
+            all_params = {**panel_params, **orientation_params}
 
-                # Среднее значение радиации
-                rad_combined = pd.concat(rad_forecasts.values(), axis=1)
-                rad_combined.columns = [f'rad_{col}' for col in rad_forecasts.keys()]
-                rad_combined['mean_rad'] = rad_combined.mean(axis=1)
+            # 1. Прогноз солнечной радиации
+            rad_forecasts = {}
+            for model_type in ['tcn', 'transformer', 'tf', 'nbeats']:
+                forecast = make_predictions(models, data, model_type)
+                rad_forecasts[model_type] = forecast['y']
 
-                # 2. Прогноз температуры
+            # Среднее значение радиации
+            rad_combined = pd.concat(rad_forecasts.values(), axis=1)
+            rad_combined.columns = [f'rad_{col}' for col in rad_forecasts.keys()]
+            rad_combined['mean_rad'] = rad_combined.mean(axis=1)
 
-                temp_forecasts = {}
-                for model_type in ['temp_prophet', 'temp_ets','temp_nbeats']:
-                    forecast = predict_temperature(temp_models, data, model_type)
-                    temp_forecasts[model_type] = forecast['y']
+            # 2. Прогноз температуры
 
-                # Среднее значение радиации
-                temp_combined = pd.concat(temp_forecasts.values(), axis=1)
-                temp_combined.columns = [f'temp_{col}' for col in temp_forecasts.keys()]
-                temp_combined['mean_temp'] = temp_combined.mean(axis=1)
+            temp_forecasts = {}
+            for model_type in ['temp_prophet', 'temp_ets', 'temp_nbeats']:
+                forecast = predict_temperature(temp_models, data, model_type)
+                temp_forecasts[model_type] = forecast['y']
 
-                if temp_combined is None:
-                    st.error("Ошибка прогноза температуры")
-                    return
+            # Среднее значение радиации
+            temp_combined = pd.concat(temp_forecasts.values(), axis=1)
+            temp_combined.columns = [f'temp_{col}' for col in temp_forecasts.keys()]
+            temp_combined['mean_temp'] = temp_combined.mean(axis=1)
 
-                # 3. Расчёт энергии
-                final_df = calculate_energy(rad_combined[['mean_rad']], temp_combined[['mean_temp']], panel_params)
+            if temp_combined is None:
+                st.error("Ошибка прогноза температуры")
+                return
 
-                # 4. Построение графиков
-                fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(14, 12))
+            # 3. Расчёт энергии
+            final_df = calculate_energy(rad_combined[['mean_rad']], temp_combined[['mean_temp']], all_params)
 
-                # График солнечной радиации
-                rad_combined['mean_rad'].plot(ax=ax1, color='orange', label='Средняя радиация')
-                ax1.set_title('Прогноз солнечной радиации')
-                ax1.set_ylabel('кВт·ч/м²')
-                ax1.legend()
+            # 4. Построение графиков
+            fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(14, 12))
 
-                # График температуры
-                final_df['mean_temp'].plot(ax=ax2, color='red', label='Температура воздуха')
-                ax2.set_title('Прогноз температуры')
-                ax2.set_ylabel('°C')
-                ax2.legend()
+            # График солнечной радиации
+            rad_combined['mean_rad'].plot(ax=ax1, color='orange', label='Средняя радиация')
+            ax1.set_title('Прогноз солнечной радиации')
+            ax1.set_ylabel('кВт·ч/м²')
+            ax1.legend()
 
-                # График энергии
-                final_df['energy'].plot(ax=ax3, color='green', label='Суточная выработка')
-                final_df['energy'].cumsum().plot(
-                    ax=ax3, color='blue', secondary_y=True,
-                    label='Накопленная энергия', linestyle='--')
-                ax3.set_title('Выработка энергии')
-                ax3.set_ylabel('кВт·ч (суточная)')
-                ax3.right_ax.set_ylabel('кВт·ч (накопленная)')
-                ax3.legend(loc='upper left')
-                ax3.right_ax.legend(loc='upper right')
+            # График температуры
+            final_df['mean_temp'].plot(ax=ax2, color='red', label='Температура воздуха')
+            ax2.set_title('Прогноз температуры')
+            ax2.set_ylabel('°C')
+            ax2.legend()
 
-                plt.tight_layout()
-                st.pyplot(fig)
+            # График энергии
+            final_df['energy'].plot(ax=ax3, color='green', label='Суточная выработка')
+            final_df['energy'].cumsum().plot(
+                ax=ax3, color='blue', secondary_y=True,
+                label='Накопленная энергия', linestyle='--')
+            ax3.set_title('Выработка энергии')
+            ax3.set_ylabel('кВт·ч (суточная)')
+            ax3.right_ax.set_ylabel('кВт·ч (накопленная)')
+            ax3.legend(loc='upper left')
+            ax3.right_ax.legend(loc='upper right')
 
-                # Экспорт результатов
-                st.download_button(
-                    label="Скачать полные данные",
-                    data=final_df.reset_index().to_csv(index=False),
-                    file_name='full_forecast.csv',
-                    mime='text/csv'
-                )
+            plt.tight_layout()
+            st.pyplot(fig)
+
+            # Экспорт результатов
+            st.download_button(
+                label="Скачать полные данные",
+                data=final_df.reset_index().to_csv(index=False),
+                file_name='full_forecast.csv',
+                mime='text/csv'
+            )
+
+def calculate_energy(solar_rad, temperature_df , panel_params):
+
+    default_params = {
+        'k0': 30.02,
+        'k1': 6.28,  #
+        'beta': -0.0041,  # Отрицательный коэффициент
+        'A': 1.65,  # Площадь панели
+        'eta_nom': 0.153,  # Номинальный КПД
+        'wind_speed': 1.2,
+        'K_L' : 0.9,
+        'tilt': 30.0,
+        'azimuth': 180.0,        # Фиксированное значение по статье
+    }
+
+    # Объединяем параметры (пользовательские имеют приоритет)
+    params = {**default_params, **panel_params}
+
+    # Валидация критических параметров
+    if params['A'] <= 0:
+        raise ValueError("Площадь панели должна быть положительной")
+    if not (0 < params['eta_nom'] <= 0.4):
+        raise ValueError("КПД должен быть в диапазоне 0-40%")
+
+    # Объединение данных по датам
+    combined = solar_rad.join(temperature_df, how='inner')
+    print(params)
+    # Расчёт энергии для каждой даты
+    energy = []
+
+    lat = st.session_state.lat
+    lon = st.session_state.lon
+
+    # 1. Фиксированный угол наклона исторического датчика (для летнего солнцестояния)
+    declination_summer = 23.45
+    tilt_d = lat - declination_summer # Азимут датчика (юг)
+    azimuth_d = 180
+
+    for idx, row in combined.iterrows():
+        day_of_year = idx.timetuple().tm_yday
+
+        # 1. Расчет склонения солнца
+        declination = 23.45 * np.sin(np.radians(360 * (284 + day_of_year) / 365))
+
+        # 2. Расчет зенитного угла в полдень
+        zenith = abs(lat - declination)
+
+        # 3. Расчет угла падения для датчика (оптимальный для лета)
+        cos_theta_d = np.cos(np.radians(zenith - tilt_d))
+
+        # 4. Расчет угла падения для панели пользователя
+        # Упрощенная формула для полудня (солнце на юге)
+        cos_theta_p = np.cos(np.radians(zenith - params['tilt']))
+
+        # 5. Защита от нереалистичных значений
+        cos_theta_d = max(0.1, cos_theta_d)
+        cos_theta_p = max(0.1, cos_theta_p)
+        print(cos_theta_d, cos_theta_p , cos_theta_p / cos_theta_d)
+        # 6. Пересчет радиации
+        effective_rad = row['mean_rad'] * (cos_theta_p / cos_theta_d)
+
+        T_pv = row['mean_temp'] + effective_rad /(params['k0'] + params['k1'] * params['wind_speed'])
+
+        # Расчёт КПД
+        eta = params['eta_nom'] * (1 + params['beta'] * (T_pv - 48))
+
+        # Расчёт энергии
+        energy.append(effective_rad * eta * params['A'] * params['K_L'])
+    combined['energy'] = energy
+    return combined
+
+def calculate_optimal_angles(lat):
+    """Расчёт оптимальных углов наклона"""
+    return {
+        'static': round(lat, 2),
+        'dynamic': {
+            'winter': round(lat + 15, 2),
+            'spring_autumn': round(lat, 2),
+            'summer': round(lat - 15, 2)
+        }
+    }
+
+def get_solar_noon(lat, lon):
+    """Точный расчёт времени солнечного полдня с учётом даты и координат"""
+    try:
+        # Определение часового пояса
+        tf = TimezoneFinder()
+        tz_name = tf.timezone_at(lat=lat, lng=lon) or "UTC"
+        tz = pytz.timezone(tz_name)
+
+        # Создание объекта LocationInfo
+        loc = LocationInfo("custom", "region", tz_name, lat, lon)
+
+        # Расчёт для сегодняшней даты
+        s = sun(loc.observer, date=datetime.now(), tzinfo=tz)
+
+        return s["noon"].strftime("%H:%M"), tz_name
+
+    except Exception as e:
+        st.error(f"Ошибка расчёта: {str(e)}")
+        return "12:00", "UTC"
+
+def handle_panel_positioning():
+    st.header("Оптимальное положение солнечных панелей")
+
+    location_mode = st.radio(
+        "Способ задания местоположения:",
+        ['По названию города', 'По координатам']
+    )
+
+    if 'lat' not in st.session_state:
+        st.session_state.lat = None
+    if 'lon' not in st.session_state:
+        st.session_state.lon = None
+
+    if location_mode == 'По названию города':
+        city = st.text_input("Введите название города:")
+        if city:
+            with st.spinner('Поиск координат...'):
+                try:
+                    geolocator = Nominatim(user_agent="solar_app")
+                    location = geolocator.geocode(city)
+                    if location:
+                        st.session_state.lat = location.latitude
+                        st.session_state.lon = location.longitude
+                    else:
+                        st.error("Город не найден")
+                except Exception as e:
+                    st.error(f"Ошибка геокодинга: {str(e)}")
+
+    else:
+        col1, col2 = st.columns(2)
+        with col1:
+            st.session_state.lat = st.number_input(
+                "Широта (°)",
+                min_value=-90.0,
+                max_value=90.0,
+                value=55.75
+            )
+        with col2:
+            st.session_state.lon = st.number_input(
+                "Долгота (°)",
+                min_value=-180.0,
+                max_value=180.0,
+                value=37.61
+            )
+
+    if st.session_state.lat and st.session_state.lon:
+        show_panel_recommendations()
+
+def show_panel_recommendations():
+    lat = st.session_state.lat
+    lon = st.session_state.lon
+
+    # Расчёт оптимальных углов
+    static_angle = round(lat, 2)
+    dynamic_angles = {
+        'Зима (дек-мар)': round(lat + 15, 2),
+        'Весна/осень': round(lat, 2),
+        'Лето (июн-сен)': round(lat - 15, 2)
+    }
+
+    # Расчёт времени пиковой радиации
+    solar_noon, tz = get_solar_noon(lat, lon)
+
+    # Отображение результатов
+    st.subheader("Рекомендации по установке")
+
+    cols = st.columns(3)
+    cols[0].metric("Широта", f"{lat:.2f}°")
+    cols[1].metric("Долгота", f"{lon:.2f}°")
+    cols[2].metric("Пик радиации",
+                   f"{solar_noon} ({tz})",
+                   "Местное время")
+
+    st.markdown("### Оптимальные углы наклона")
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("**Статичная установка (год без регулировки):**")
+        st.markdown(f"```\n{static_angle}°\n```")
+        st.markdown("*Среднегодовой оптимальный угол*")
+
+    with col2:
+        st.markdown("**Динамическая регулировка (3-4 раза в год):**")
+        for period, angle in dynamic_angles.items():
+            st.markdown(f"- **{period}**: `{angle}°`")
+
+    st.markdown("---")
+    st.map(pd.DataFrame({'lat': [lat], 'lon': [lon]}))
+
+def main():
+    st.title("Прогнозирование выработонной энергии солнечной панелью")
+
+    st.sidebar.header("Режим работы")
+    mode = st.sidebar.radio("Выберите режим:", ['Прогнозирование', 'Обучение', 'Расположение панели'])
+
+    if mode == 'Расположение панели':
+        handle_panel_positioning()
+
+    elif mode == 'Обучение':
+        handle_training()
+
+    elif mode == 'Прогнозирование':
+        handle_prediction()
 
 
 if __name__ == "__main__":
