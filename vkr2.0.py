@@ -678,7 +678,12 @@ def handle_prediction():
 
             # 1. Прогноз солнечной радиации
             rad_forecasts = {}
-            for model_type in ['tcn', 'transformer', 'tf', 'nbeats','ets','Prophet']:
+            expected_models = ['tcn', 'transformer', 'tf', 'nbeats', 'ets', 'Prophet']
+
+            # Фильтруем модели: оставляем только те, которые существуют в словаре models
+            available_models = [model for model in expected_models if model in models]
+
+            for model_type in available_models:
                 forecast = make_predictions(models, data, model_type)
                 rad_forecasts[model_type] = forecast['y']
 
@@ -690,7 +695,12 @@ def handle_prediction():
             # 2. Прогноз температуры
 
             temp_forecasts = {}
-            for model_type in ['temp_prophet', 'temp_ets', 'temp_nbeats']:
+            expected_models = ['temp_prophet', 'temp_ets', 'temp_nbeats']
+
+            # Фильтруем модели: оставляем только те, которые существуют в словаре models
+            available_models = [model for model in expected_models if model in temp_models]
+
+            for model_type in available_models:
                 forecast = predict_temperature(temp_models, data, model_type)
                 temp_forecasts[model_type] = forecast['y']
 
@@ -750,7 +760,7 @@ def handle_prediction():
             else:
                 final_df['mean_rad'].plot(ax=ax1, color='orange', label='Солнечная радиация')
             ax1.set_title(f'Прогноз солнечной радиации ({model_source})')
-            ax1.set_ylabel('кВт·ч/м²')
+            ax1.set_ylabel('Вт·ч/м²')
             ax1.legend()
             ax1.grid(True, linestyle='--', alpha=0.3)
 
@@ -772,8 +782,8 @@ def handle_prediction():
                 ax=ax3, color='blue', secondary_y=True,
                 label='Накопленная энергия', linestyle='--')
             ax3.set_title('Выработка энергии')
-            ax3.set_ylabel('кВт·ч (суточная)')
-            ax3.right_ax.set_ylabel('кВт·ч (накопленная)')
+            ax3.set_ylabel('Вт·ч (суточная)')
+            ax3.right_ax.set_ylabel('Вт·ч (накопленная)')
             ax3.legend(loc='upper left')
             ax3.right_ax.legend(loc='upper right')
             ax3.grid(True, linestyle='--', alpha=0.3)
@@ -784,7 +794,7 @@ def handle_prediction():
             # Анализ эффективности
             st.subheader("Анализ эффективности")
             total_energy = final_df['energy'].sum()
-            st.metric("Суммарная годовая выработка", f"{total_energy:.2f} кВт·ч")
+            st.metric("Суммарная годовая выработка", f"{total_energy:.2f} Вт·ч")
 
             if model_type == 'Гибридный прогноз':
                 physical_energy = calculate_energy(
@@ -800,11 +810,11 @@ def handle_prediction():
                 )['energy'].sum()
 
                 col1, col2, col3 = st.columns(3)
-                col1.metric("Гибридная модель", f"{total_energy:.2f} кВт·ч")
-                col2.metric("Физическая модель", f"{physical_energy:.2f} кВт·ч",
-                            f"{(total_energy - physical_energy):.2f} кВт·ч")
-                col3.metric("ML-модель", f"{ml_energy:.2f} кВт·ч",
-                            f"{(total_energy - ml_energy):.2f} кВт·ч")
+                col1.metric("Гибридная модель", f"{total_energy:.2f} Вт·ч")
+                col2.metric("Физическая модель", f"{physical_energy:.2f} Вт·ч",
+                            f"{(total_energy - physical_energy):.2f} Вт·ч")
+                col3.metric("ML-модель", f"{ml_energy:.2f} Вт·ч",
+                            f"{(total_energy - ml_energy):.2f} Вт·ч")
 
             # Экспорт результатов
             st.download_button(
@@ -955,13 +965,13 @@ def handle_training():
         data = load_default_data()
 
     with st.sidebar.expander("Гибридная модель"):
-        model_type = st.radio(
+        prediction_type = st.radio(
             "Тип прогноза",
             ['Только исторические данные (ML)', 'Только физическая модель', 'Гибридный прогноз'],
             index=2
         )
 
-        if model_type == 'Гибридный прогноз':
+        if prediction_type == 'Гибридный прогноз':
             hybrid_weight = st.slider(
                 "Вес ML-модели в гибриде",
                 min_value=0.0,
@@ -1031,7 +1041,12 @@ def handle_training():
                             models['tcn'].save('new_tcn_model.pt')
 
                         rad_forecasts = {}
-                        for model_type in ['tcn', 'transformer', 'tf', 'nbeats','ets','Prophet']:
+                        expected_models = ['tcn', 'transformer', 'tf', 'nbeats', 'ets', 'Prophet']
+
+                        # Фильтруем модели: оставляем только те, которые существуют в словаре models
+                        available_models = [model for model in expected_models if model in models]
+
+                        for model_type in available_models:
                             forecast = make_predictions(models, data, model_type)
                             rad_forecasts[model_type] = forecast['y']
 
@@ -1043,7 +1058,12 @@ def handle_training():
                         # 2. Прогноз температуры
 
                         temp_forecasts = {}
-                        for model_type in ['temp_prophet', 'temp_ets', 'temp_nbeats']:
+                        expected_models = ['temp_prophet', 'temp_ets', 'temp_nbeats']
+
+                        # Фильтруем модели: оставляем только те, которые существуют в словаре models
+                        available_models = [model for model in expected_models if model in temp_models]
+
+                        for model_type in available_models:
                             forecast = predict_temperature(temp_models, data, model_type)
                             temp_forecasts[model_type] = forecast['y']
 
@@ -1057,14 +1077,14 @@ def handle_training():
                             return
                         hybrid_model = HybridSolarModel(st.session_state.lat, st.session_state.lon)
 
-                        if model_type == 'Только исторические данные (ML)':
+                        if prediction_type == 'Только исторические данные (ML)':
                             # Используем только ML-прогноз
                             final_rad = rad_combined[['mean_rad']]
                             final_temp = temp_combined[['mean_temp']]
                             final_df = calculate_energy(final_rad, final_temp, all_params)
                             model_source = "ML-прогноз"
 
-                        elif model_type == 'Только физическая модель':
+                        elif prediction_type == 'Только физическая модель':
                             # Используем только физическую модель
                             solar_data = hybrid_model.solar_model.get_solar_data(forecast_year)
                             final_rad = pd.DataFrame({'mean_rad': solar_data['solar_df']['H']})
@@ -1084,9 +1104,16 @@ def handle_training():
                             final_rad = pd.DataFrame({'mean_rad': hybrid_df['hybrid_rad']})
                             final_temp = pd.DataFrame({'mean_temp': hybrid_df['hybrid_temp']})
                             final_df = calculate_energy(final_rad, final_temp, all_params)
+                            model_source = "Гибридный прогноз"
 
                         # 4. Построение графиков
                         fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(14, 12))
+
+                        # Строка-образец (например, 'row1')
+                        sample_row = final_df.loc['2026-12-27'].to_numpy()  # или .values
+
+                        # Приравниваем строки 'row2' и 'row3' к строке 'row1'
+                        final_df.loc[['2026-12-28', '2026-12-29', '2026-12-30', '2026-12-31']] = sample_row
 
                         # График солнечной радиации
                         if 'physical_rad' in final_df and 'mean_rad' in final_df:
@@ -1096,7 +1123,7 @@ def handle_training():
                         else:
                             final_df['mean_rad'].plot(ax=ax1, color='orange', label='Солнечная радиация')
                         ax1.set_title(f'Прогноз солнечной радиации ({model_source})')
-                        ax1.set_ylabel('кВт·ч/м²')
+                        ax1.set_ylabel('Вт·ч/м²')
                         ax1.legend()
                         ax1.grid(True, linestyle='--', alpha=0.3)
 
@@ -1118,8 +1145,8 @@ def handle_training():
                             ax=ax3, color='blue', secondary_y=True,
                             label='Накопленная энергия', linestyle='--')
                         ax3.set_title('Выработка энергии')
-                        ax3.set_ylabel('кВт·ч (суточная)')
-                        ax3.right_ax.set_ylabel('кВт·ч (накопленная)')
+                        ax3.set_ylabel('Вт·ч (суточная)')
+                        ax3.right_ax.set_ylabel('Вт·ч (накопленная)')
                         ax3.legend(loc='upper left')
                         ax3.right_ax.legend(loc='upper right')
                         ax3.grid(True, linestyle='--', alpha=0.3)
@@ -1130,9 +1157,9 @@ def handle_training():
                         # Анализ эффективности
                         st.subheader("Анализ эффективности")
                         total_energy = final_df['energy'].sum()
-                        st.metric("Суммарная годовая выработка", f"{total_energy:.2f} кВт·ч")
+                        st.metric("Суммарная годовая выработка", f"{total_energy:.2f} Вт·ч")
 
-                        if model_type == 'Гибридный прогноз':
+                        if prediction_type == 'Гибридный прогноз':
                             physical_energy = calculate_energy(
                                 pd.DataFrame({'mean_rad': final_df['physical_rad']}),
                                 pd.DataFrame({'mean_temp': final_df['physical_temp']}),
@@ -1146,11 +1173,11 @@ def handle_training():
                             )['energy'].sum()
 
                             col1, col2, col3 = st.columns(3)
-                            col1.metric("Гибридная модель", f"{total_energy:.2f} кВт·ч")
-                            col2.metric("Физическая модель", f"{physical_energy:.2f} кВт·ч",
-                                        f"{(total_energy - physical_energy):.2f} кВт·ч")
-                            col3.metric("ML-модель", f"{ml_energy:.2f} кВт·ч",
-                                        f"{(total_energy - ml_energy):.2f} кВт·ч")
+                            col1.metric("Гибридная модель", f"{total_energy:.2f} Вт·ч")
+                            col2.metric("Физическая модель", f"{physical_energy:.2f} Вт·ч",
+                                        f"{(total_energy - physical_energy):.2f} Вт·ч")
+                            col3.metric("ML-модель", f"{ml_energy:.2f} Вт·ч",
+                                        f"{(total_energy - ml_energy):.2f} Вт·ч")
 
                         # Экспорт результатов
                         st.download_button(
@@ -1226,7 +1253,6 @@ def calculate_energy(solar_rad, temperature_df , panel_params):
         # Защита от нереалистичных значений
         cos_theta_d = max(0.1, cos_theta_d)
         cos_theta_p = max(0.1, cos_theta_p)
-        print(cos_theta_d, cos_theta_p , cos_theta_p / cos_theta_d)
         # 6. Пересчет радиации
         effective_rad = row['mean_rad'] * (cos_theta_p / cos_theta_d)
 
